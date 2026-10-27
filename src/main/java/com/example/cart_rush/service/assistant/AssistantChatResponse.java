@@ -13,7 +13,17 @@ public record AssistantChatResponse(
                 String aiFallbackReason,
                 List<String> relaxedFilters,
                 CartView cart,
-                List<OrderView> orders) {
+                List<OrderView> orders,
+                List<String> categories,
+                List<ReviewSummary> reviews) {
+
+            public AssistantChatResponse(String reply, List<ProductMatch> products, ShoppingIntent filters,
+                             String source, boolean aiUsedForIntent, boolean replyGeneratedByAi,
+                             String aiFallbackReason, List<String> relaxedFilters,
+                             CartView cart, List<OrderView> orders) {
+                this(reply, products, filters, source, aiUsedForIntent, replyGeneratedByAi,
+                    aiFallbackReason, relaxedFilters, cart, orders, List.of(), List.of());
+            }
 
         public AssistantChatResponse(String reply, List<ProductMatch> products, ShoppingIntent filters,
                                                                  String source, boolean aiUsedForIntent, boolean replyGeneratedByAi,
@@ -32,6 +42,8 @@ public record AssistantChatResponse(
                 products = products == null ? List.of() : List.copyOf(products);
                 relaxedFilters = relaxedFilters == null ? List.of() : List.copyOf(relaxedFilters);
                 orders = orders == null ? List.of() : List.copyOf(orders);
+                categories = categories == null ? List.of() : List.copyOf(categories);
+                reviews = reviews == null ? List.of() : List.copyOf(reviews);
         }
 
     public record CartView(List<CartEntry> items, BigDecimal total) {
@@ -52,6 +64,16 @@ public record AssistantChatResponse(
     }
 
     public record OrderEntry(Long productId, String name, Integer quantity, BigDecimal unitPrice) {
+    }
+
+    public record ReviewSummary(Long productId, String productName, double averageRating,
+                                long ratingCount, List<ReviewEntry> reviews) {
+        public ReviewSummary {
+            reviews = reviews == null ? List.of() : List.copyOf(reviews);
+        }
+    }
+
+    public record ReviewEntry(Integer rating, String comment) {
     }
 
     public record ProductMatch(

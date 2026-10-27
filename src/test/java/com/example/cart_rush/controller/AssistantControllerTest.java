@@ -42,6 +42,8 @@ class AssistantControllerTest {
                 Mockito.mock(com.example.cart_rush.repository.CartItemRepository.class),
                 Mockito.mock(com.example.cart_rush.repository.OrderRepository.class),
                 Mockito.mock(com.example.cart_rush.repository.OrderItemRepository.class),
+                Mockito.mock(com.example.cart_rush.repository.SupplierRepository.class),
+                Mockito.mock(com.example.cart_rush.repository.UserRepository.class),
                 intentProvider, geminiClient, new ShoppingIntentFallbackParser());
         when(intentProvider.analyze("hi", List.of()))
                 .thenReturn(new AssistantAnalysis(AssistantIntent.GREETING, ShoppingIntent.empty(), null));
@@ -80,6 +82,8 @@ class AssistantControllerTest {
                 Mockito.mock(com.example.cart_rush.repository.CartItemRepository.class),
                 Mockito.mock(com.example.cart_rush.repository.OrderRepository.class),
                 Mockito.mock(com.example.cart_rush.repository.OrderItemRepository.class),
+                Mockito.mock(com.example.cart_rush.repository.SupplierRepository.class),
+                Mockito.mock(com.example.cart_rush.repository.UserRepository.class),
                 intentProvider, geminiClient, new ShoppingIntentFallbackParser());
         when(intentProvider.analyze("hi", List.of()))
                 .thenReturn(new AssistantAnalysis(AssistantIntent.GREETING, ShoppingIntent.empty(), null));

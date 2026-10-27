@@ -48,8 +48,8 @@ async function cartItems() {
     return items;
 }
 const addToCart = guard(async (pid, qty = 1) => {
-    if (user && user.role === "SUPPLIER") { location.hash = "#/manage"; return toast("Suppliers cannot add products to a customer cart.", true); }
-    if (!user) { location.hash = "#/login"; return toast("Please log in first", true); }
+    if (user && user.role === "SUPPLIER") { $("#assistant-close")?.click(); location.hash = "#/manage"; return toast("Suppliers cannot add products to a customer cart.", true); }
+    if (!user) { $("#assistant-close")?.click(); location.hash = "#/login"; return toast("Please log in first", true); }
     const c = await getCart(), items = await cartItems();
     const ex = items.find(i => i.product.id === pid);
     if (ex) await api(`/cart-items/${ex.id}?quantity=${ex.quantity + qty}`, { method: "PUT" });
@@ -69,7 +69,12 @@ function renderNav() {
         `<button onclick="logout()">Logout (${esc(user.name)})</button>`
         : `<a href="#/login">Login</a><a class="btn sm" href="#/register">Sign up</a>`);
 }
-function logout() { localStorage.removeItem("cr_user"); user = null; cartObj = null; cartCount = 0; renderNav(); location.hash = "#/"; }
+function logout() {
+    assistantAbortController?.abort(); assistantAbortController = null;
+    assistantMessages = []; assistantLiveState = "Ready"; sessionStorage.removeItem(ASSISTANT_HISTORY_KEY);
+    $("#assistant-close")?.click(); renderAssistantConversation();
+    localStorage.removeItem("cr_user"); user = null; cartObj = null; cartCount = 0; renderNav(); location.hash = "#/";
+}
 
 /* ===== router ===== */
 const view = h => $("#app").innerHTML = h;
@@ -79,12 +84,14 @@ const routes = [
     [/^#\/manage$/, managePage], [/^#\/supplier-dashboard$/, managePage], [/^#\/supplier-products$/, managePage], [/^#\/supplier-orders$/, supplierOrdersPage]
 ];
 async function route() {
+    if (assistantOpen) $("#assistant-close")?.click();
     const h = location.hash || "#/";
     window.scrollTo(0, 0);
     try {
         for (const [re, fn] of routes) { const m = h.match(re); if (m) return await fn(m[1]); }
         await homePage();
     } catch (e) { view(`<div class="empty">⚠️ ${esc(e.message)}<br><small>Is the backend running at ${API_BASE}?</small></div>`); }
+    finally { renderAssistantWidget(); }
 }
 
 /* ===== pages ===== */
@@ -93,7 +100,7 @@ const card = p => `<div class="card"><a href="#/product/${p.id}" style="text-dec
   <h3>${esc(p.name)}</h3><div class="mu">${esc(p.brand || "")}</div><div>${stars(ratings[p.id])}</div>
   <div>${p.category ? `<span class="tag">${esc(p.category.name)}</span>` : ""}${p.waterproof ? `<span class="tag g">Waterproof</span>` : ""}</div>
   <div class="price">${money(p.price)}</div>
-  ${p.stock > 0 ? `<button class="btn sm" onclick="addToCart(${p.id})">Add to cart</button>` : `<span class="tag r">Out of stock</span>`}${p.stock > 0 && p.stock <= 10 ? `<div class="low">Only ${p.stock} left!</div>` : ""}
+  ${p.stock <= 0 ? `<span class="tag r">Out of stock</span>` : (user && user.role === "SUPPLIER" ? "" : `<button class="btn sm" onclick="addToCart(${p.id})">Add to cart</button>`)}${p.stock > 0 && p.stock <= 10 ? `<div class="low">Only ${p.stock} left!</div>` : ""}
   <a class="btn sm sec" href="#/product/${p.id}">Details</a></div></div>`;
 
 let filters = { name: "", brand: "", min: "", max: "", cat: "" };
@@ -117,13 +124,14 @@ function assistantConversationMarkup() {
         const products = message.products || [];
         const productMarkup = products.length
             ? `${message.relaxedFilters?.length ? `<p class="assistant-alternative-note">Closest alternatives; relaxed: ${esc(message.relaxedFilters.join(", "))}. Price, stock, and waterproof requirements were kept.</p>` : ""}<div class="grid assistant-products">${products.map(card).join("")}</div>` : "";
-        const cartData = message.cart;
+        const isSupplier = user && user.role === "SUPPLIER";
+        const cartData = isSupplier ? null : message.cart;
         const cartMarkup = cartData
             ? `<div class="assistant-account-block"><b>Your cart</b>${cartData.items.length
                 ? cartData.items.map(item => `<p class="assistant-account-row"><a href="#/product/${item.productId}">${esc(item.name)}</a><span>× ${item.quantity} · ${money(item.lineTotal)}</span></p>`).join("") +
                   `<p class="assistant-account-total">Total: ${money(cartData.total)}</p><a class="btn sm" href="#/cart">Go to cart</a>`
                 : `<p class="assistant-account-row">Your cart is empty.</p>`}</div>`
-            : "";
+            : "";isSupplier ? [] : (message.orders || [])
         const orders = message.orders || [];
         const ordersMarkup = orders.length
             ? `<div class="assistant-account-block">${orders.map(order => `
@@ -154,12 +162,11 @@ function renderAssistantConversation() {
         sessionStorage.setItem(ASSISTANT_HISTORY_KEY, JSON.stringify(history));
     } catch { }
 }
-async function homePage() {
-    if (user && user.role === "SUPPLIER") { location.hash = "#/manage"; return; }
-    const cats = await api("/categories").catch(() => []);
-    view(`<section class="hero"><div><h1>Gear up for every adventure.</h1><p>Waterproof watches, bags, shoes &amp; jackets — delivered fast.</p>
-    <a class="btn" href="#list">Shop now</a></div><div class="hstats"><b>15+</b><span>Products</span><b>★ 4.5</b><span>Avg rating</span></div></section>
-        <div class="assistant-widget">
+
+function renderAssistantWidget() {
+    if (document.getElementById("assistant-widget")) return;
+    document.body.insertAdjacentHTML("beforeend", `
+        <div class="assistant-widget" id="assistant-widget">
             <button class="assistant-backdrop" id="assistant-backdrop" type="button" aria-label="Close shopping assistant" ${assistantOpen ? "" : "hidden"}></button>
             <section class="assistant-window" id="assistant-window" aria-labelledby="assistant-title" ${assistantOpen ? "" : "hidden"}>
                 <header class="assistant-head"><div class="assistant-brand"><span class="assistant-avatar">CR</span><div><h2 id="assistant-title">Shopping assistant</h2><p class="assistant-header-state" id="assistant-header-state"><i></i><span>${esc(assistantLiveState)}</span></p></div></div><div class="assistant-actions"><button class="assistant-clear" id="assistant-clear" type="button" title="Clear chat">Clear</button><button class="assistant-close" id="assistant-close" type="button" aria-label="Close chat" title="Close chat"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6 6 12 12M18 6 6 18"/></svg></button></div></header>
@@ -170,7 +177,150 @@ async function homePage() {
             <button class="assistant-launcher" id="assistant-launcher" type="button" aria-controls="assistant-window" aria-expanded="${assistantOpen}" aria-label="Open shopping assistant" title="Open shopping assistant">
                 <svg class="assistant-launcher-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M20 11.5a7.5 7.5 0 0 1-7.5 7.5H6l-3 2v-6.5A7.5 7.5 0 1 1 20 11.5Z"/><path d="M8 11.5h.01M12 11.5h.01M16 11.5h.01"/></svg>
             </button>
-        </div>
+        </div>`);
+
+    const toggleAssistant = open => {
+        if (!open && assistantAbortController) assistantAbortController.abort();
+        assistantOpen = open;
+        const assistantWindow = $("#assistant-window"), launcher = $("#assistant-launcher");
+        assistantWindow.hidden = !open;
+        $("#assistant-backdrop").hidden = !open;
+        launcher.setAttribute("aria-expanded", String(open));
+        if (open) $("#assistant-message").focus();
+    };
+    $("#assistant-launcher").onclick = () => toggleAssistant(true);
+    $("#assistant-close").onclick = () => toggleAssistant(false);
+    $("#assistant-backdrop").onclick = () => toggleAssistant(false);
+    $("#assistant-clear").onclick = () => {
+        assistantAbortController?.abort();
+        assistantAbortController = null;
+        assistantLiveState = "Ready";
+        $("#assistant-header-state span").textContent = assistantLiveState;
+        assistantMessages = [];
+        sessionStorage.removeItem(ASSISTANT_HISTORY_KEY);
+        renderAssistantConversation();
+    };
+    $("#assistant-message").onkeydown = event => {
+        if (event.key === "Escape") toggleAssistant(false);
+        if (event.key === "Enter" && !event.shiftKey) {
+            event.preventDefault();
+            $("#assistant-form").requestSubmit();
+        }
+    };
+    $("#assistant-stop").onclick = () => assistantAbortController?.abort();
+    $("#assistant-conversation").addEventListener("click", event => {
+        const link = event.target.closest("a[href^='#/']");
+        if (!link) return;
+        event.preventDefault();
+        const target = link.getAttribute("href");
+        toggleAssistant(false);
+        if (location.hash === target) route(); else location.hash = target;
+    });
+    $("#assistant-form").onsubmit = submitAssistantMessage;
+}
+
+async function submitAssistantMessage(event) {
+    event.preventDefault();
+    const button = $("#assistant-submit"), input = $("#assistant-message");
+    const message = input.value.trim();
+    if (!message) return;
+    assistantMessages.push({ role: "user", text: message });
+    const boundedHistory = assistantMessages.slice(0, -1).slice(-MAX_ASSISTANT_TURNS * 2)
+        .filter(turn => (turn.role === "user" || turn.role === "assistant")
+            && !turn.pending && !turn.status && String(turn.text || "").trim())
+        .map(turn => ({ role: turn.role, content: String(turn.text || "").slice(0, 2000) }));
+    const assistantIndex = assistantMessages.length;
+    assistantMessages.push({ role: "assistant", text: "", status: "Understanding your message", pending: true });
+    input.value = "";
+    button.disabled = true;
+    $("#assistant-stop").hidden = false;
+    assistantAbortController = new AbortController();
+    assistantLiveState = "Connecting";
+    $("#assistant-header-state span").textContent = assistantLiveState;
+    $("#assistant-header-state").className = "assistant-header-state is-active";
+    renderAssistantConversation();
+    try {
+        const response = await fetch(API_BASE + "/assistant/chat/stream", {
+            method: "POST", headers: { "Content-Type": "application/json", "Accept": "text/event-stream" },
+            body: JSON.stringify({ message, history: boundedHistory, userId: user ? user.id : null }), signal: assistantAbortController.signal
+        });
+        if (!response.ok || !response.body) throw new Error(`Assistant request failed (${response.status})`);
+        const reader = response.body.getReader(), decoder = new TextDecoder();
+        let buffer = "", finished = false;
+        const handleEvent = eventBlock => {
+            let eventName = "message", dataText = "";
+            for (const line of eventBlock.split("\n")) {
+                if (line.startsWith("event:")) eventName = line.slice(6).trim();
+                else if (line.startsWith("data:")) dataText += line.slice(5).trim();
+            }
+            if (!dataText) return;
+            const payload = JSON.parse(dataText), current = assistantMessages[assistantIndex];
+            if (eventName === "status") {
+                current.status = payload.text || "Thinking";
+                assistantLiveState = current.status;
+                $("#assistant-header-state span").textContent = assistantLiveState;
+            } else if (eventName === "token") {
+                current.text += payload.text || "";
+                current.status = "";
+                assistantLiveState = "Streaming";
+                $("#assistant-header-state span").textContent = assistantLiveState;
+            } else if (eventName === "final") {
+                const result = payload.response || {};
+                Object.assign(current, {
+                    text: result.reply || current.text,
+                    products: result.products || [], source: result.source,
+                    aiUsedForIntent: result.aiUsedForIntent,
+                    replyGeneratedByAi: result.replyGeneratedByAi,
+                    aiFallbackReason: result.aiFallbackReason,
+                    relaxedFilters: result.relaxedFilters || [],
+                    cart: result.cart || null, orders: result.orders || [], intent: payload.intent,
+                    status: "", pending: false
+                });
+                assistantLiveState = result.source === "FALLBACK" ? "Using local fallback" : "Ready";
+                $("#assistant-header-state span").textContent = assistantLiveState;
+                $("#assistant-header-state").className = `assistant-header-state ${result.source === "FALLBACK" ? "is-fallback" : ""}`;
+                current.products.forEach(product => { ratings[product.id] = { avg: Number(product.averageRating).toFixed(1), n: product.ratingCount }; });
+                finished = true;
+            } else if (eventName === "error") {
+                throw new Error(payload.text || "Assistant stream failed");
+            }
+            renderAssistantConversation();
+        };
+        while (true) {
+            const { value, done } = await reader.read();
+            buffer += decoder.decode(value || new Uint8Array(), { stream: !done }).replace(/\r\n/g, "\n");
+            let boundary;
+            while ((boundary = buffer.indexOf("\n\n")) >= 0) {
+                handleEvent(buffer.slice(0, boundary));
+                buffer = buffer.slice(boundary + 2);
+            }
+            if (done) break;
+        }
+        if (buffer.trim()) handleEvent(buffer);
+        if (!finished) throw new Error("Assistant stream ended before the final response");
+    } catch (error) {
+        const current = assistantMessages[assistantIndex];
+        if (!current) return;
+        current.status = error.name === "AbortError" ? "Response stopped" : "Connection issue";
+        current.pending = false;
+        assistantLiveState = error.name === "AbortError" ? "Ready" : "Connection issue";
+        $("#assistant-header-state span").textContent = assistantLiveState;
+        $("#assistant-header-state").className = `assistant-header-state ${error.name === "AbortError" ? "" : "is-error"}`;
+        if (!current.text) current.text = error.name === "AbortError" ? "Stopped generating." : (error.message || "I couldn’t reach the assistant. Please try again.");
+    } finally {
+        assistantAbortController = null;
+        button.disabled = false;
+        $("#assistant-stop").hidden = true;
+        renderAssistantConversation();
+        input.focus();
+    }
+}
+
+async function homePage() {
+    if (user && user.role === "SUPPLIER") { location.hash = "#/manage"; return; }
+    const cats = await api("/categories").catch(() => []);
+    view(`<section class="hero"><div><h1>Gear up for every adventure.</h1><p>Waterproof watches, bags, shoes &amp; jackets — delivered fast.</p>
+    <a class="btn" href="#list">Shop now</a></div><div class="hstats"><b>15+</b><span>Products</span><b>★ 4.5</b><span>Avg rating</span></div></section>
         <div class="chips">${cats.map(c => `<button class="chip ${filters.cat == c.id ? "on" : ""}" onclick="$('#fc').value=${c.id};$('#go').click()">${esc(c.name)}</button>`).join("")}</div>
     <h2 id="list">Products</h2><div class="bar">
     <input id="fn" placeholder="Search name…" value="${esc(filters.name)}">
@@ -195,142 +345,6 @@ async function homePage() {
     $("#go").onclick = load;
     $("#rs").onclick = () => { filters = { name: "", brand: "", min: "", max: "", cat: "" }; homePage(); };
     $("#fn").onkeydown = e => e.key === "Enter" && load();
-    const toggleAssistant = open => {
-        if (!open && assistantAbortController) assistantAbortController.abort();
-        assistantOpen = open;
-        const window = $("#assistant-window"), launcher = $("#assistant-launcher");
-        window.hidden = !open;
-        $("#assistant-backdrop").hidden = !open;
-        launcher.setAttribute("aria-expanded", String(open));
-        if (open) $("#assistant-message").focus();
-    };
-    $("#assistant-launcher").onclick = () => toggleAssistant(true);
-    $("#assistant-close").onclick = () => toggleAssistant(false);
-    $("#assistant-backdrop").onclick = () => toggleAssistant(false);
-    $("#assistant-clear").onclick = () => {
-        if (assistantAbortController) assistantAbortController.abort();
-        assistantAbortController = null;
-        assistantLiveState = "Ready";
-        $("#assistant-header-state span").textContent = assistantLiveState;
-        assistantMessages = [];
-        sessionStorage.removeItem(ASSISTANT_HISTORY_KEY);
-        renderAssistantConversation();
-    };
-    $("#assistant-message").onkeydown = event => {
-        if (event.key === "Escape") toggleAssistant(false);
-        if (event.key === "Enter" && !event.shiftKey) {
-            event.preventDefault();
-            $("#assistant-form").requestSubmit();
-        }
-    };
-    $("#assistant-stop").onclick = () => assistantAbortController?.abort();
-    $("#assistant-form").onsubmit = async event => {
-        event.preventDefault();
-        const button = $("#assistant-submit"), input = $("#assistant-message");
-        const message = input.value.trim();
-        if (!message) return;
-        assistantMessages.push({ role: "user", text: message });
-        const boundedHistory = assistantMessages.slice(0, -1).slice(-MAX_ASSISTANT_TURNS * 2)
-            .filter(turn => (turn.role === "user" || turn.role === "assistant")
-                && !turn.pending && !turn.status && String(turn.text || "").trim())
-            .map(turn => ({ role: turn.role, content: String(turn.text || "").slice(0, 2000) }));
-        const assistantIndex = assistantMessages.length;
-        assistantMessages.push({ role: "assistant", text: "", status: "Understanding your message", pending: true });
-        input.value = "";
-        button.disabled = true;
-        $("#assistant-stop").hidden = false;
-        assistantAbortController = new AbortController();
-        assistantLiveState = "Connecting";
-        $("#assistant-header-state span").textContent = assistantLiveState;
-        $("#assistant-header-state").className = "assistant-header-state is-active";
-        renderAssistantConversation();
-        try {
-            const response = await fetch(API_BASE + "/assistant/chat/stream", {
-                method: "POST", headers: { "Content-Type": "application/json", "Accept": "text/event-stream" },
-                body: JSON.stringify({ message, history: boundedHistory, userId: user ? user.id : null }), signal: assistantAbortController.signal
-            });
-            if (!response.ok || !response.body) throw new Error(`Assistant request failed (${response.status})`);
-            const reader = response.body.getReader();
-            const decoder = new TextDecoder();
-            let buffer = "";
-            let finished = false;
-            const handleEvent = eventBlock => {
-                let eventName = "message", dataText = "";
-                for (const line of eventBlock.split("\n")) {
-                    if (line.startsWith("event:")) eventName = line.slice(6).trim();
-                    else if (line.startsWith("data:")) dataText += line.slice(5).trim();
-                }
-                if (!dataText) return;
-                const payload = JSON.parse(dataText);
-                const current = assistantMessages[assistantIndex];
-                if (eventName === "status") {
-                    current.status = payload.text || "Thinking";
-                    assistantLiveState = payload.text || "Thinking";
-                    $("#assistant-header-state span").textContent = assistantLiveState;
-                } else if (eventName === "token") {
-                    current.text += payload.text || "";
-                    current.status = "";
-                    assistantLiveState = "Streaming";
-                    $("#assistant-header-state span").textContent = assistantLiveState;
-                } else if (eventName === "final") {
-                    const result = payload.response || {};
-                    current.text = result.reply || current.text;
-                    current.products = result.products || [];
-                    current.source = result.source;
-                    current.aiUsedForIntent = result.aiUsedForIntent;
-                    current.replyGeneratedByAi = result.replyGeneratedByAi;
-                    current.aiFallbackReason = result.aiFallbackReason;
-                    current.relaxedFilters = result.relaxedFilters || [];
-                    current.cart = result.cart || null;
-                    current.orders = result.orders || [];
-                    current.intent = payload.intent;
-                    current.status = "";
-                    current.pending = false;
-                    assistantLiveState = result.source === "FALLBACK" ? "Using local fallback" : "Ready";
-                    $("#assistant-header-state span").textContent = assistantLiveState;
-                    $("#assistant-header-state").className = `assistant-header-state ${result.source === "FALLBACK" ? "is-fallback" : ""}`;
-                    current.products.forEach(product => {
-                        ratings[product.id] = { avg: Number(product.averageRating).toFixed(1), n: product.ratingCount };
-                    });
-                    finished = true;
-                } else if (eventName === "clarification") {
-                    current.status = "A quick follow-up";
-                } else if (eventName === "error") {
-                    throw new Error(payload.text || "Assistant stream failed");
-                }
-                renderAssistantConversation();
-            };
-            while (true) {
-                const { value, done } = await reader.read();
-                buffer += decoder.decode(value || new Uint8Array(), { stream: !done }).replace(/\r\n/g, "\n");
-                let boundary;
-                while ((boundary = buffer.indexOf("\n\n")) >= 0) {
-                    const block = buffer.slice(0, boundary);
-                    buffer = buffer.slice(boundary + 2);
-                    handleEvent(block);
-                }
-                if (done) break;
-            }
-            if (buffer.trim()) handleEvent(buffer);
-            if (!finished) throw new Error("Assistant stream ended before the final response");
-        } catch (error) {
-            const current = assistantMessages[assistantIndex];
-            if (!current) return;
-            current.status = error.name === "AbortError" ? "Response stopped" : "Connection issue";
-            current.pending = false;
-            assistantLiveState = error.name === "AbortError" ? "Ready" : "Connection issue";
-            $("#assistant-header-state span").textContent = assistantLiveState;
-            $("#assistant-header-state").className = `assistant-header-state ${error.name === "AbortError" ? "" : "is-error"}`;
-            if (!current.text) current.text = error.name === "AbortError" ? "Stopped generating." : (error.message || "I couldn’t reach the assistant. Please try again.");
-        } finally {
-            assistantAbortController = null;
-            if (button.disabled) button.disabled = false;
-            button.disabled = false;
-            $("#assistant-stop").hidden = true;
-            renderAssistantConversation();
-            input.focus();
-        }
-    };
     await load();
 }
 
@@ -346,8 +360,8 @@ async function productPage(id) {
       ${avg ? `<span class="stars">★ ${avg}</span> <span class="mu">(${rv.length})</span>` : ""}</p>
       <p>${esc(p.description || "No description.")}</p><div class="price">${money(p.price)}</div>
       <p class="mu">${p.stock > 0 ? p.stock + " in stock" : "Out of stock"}</p>
-      <div class="qty"><input id="q" type="number" min="1" max="${p.stock}" value="1" style="width:80px">
-      <button class="btn" ${p.stock > 0 ? "" : "disabled"} onclick="addToCart(${p.id}, Math.max(1, +$('#q').value))">Add to cart</button></div></div></div>
+      ${user && user.role === "SUPPLIER" ? "" : `<div class="qty"><input id="q" type="number" min="1" max="${p.stock}" value="1" style="width:80px">
+      <button class="btn" ${p.stock > 0 ? "" : "disabled"} onclick="addToCart(${p.id}, Math.max(1, +$('#q').value))">Add to cart</button></div>`}</div></div>
       <div class="panel"><h2>Reviews</h2>${rv.length ? rv.map(r => `<p><span class="stars">${"★".repeat(r.rating)}${"☆".repeat(5 - r.rating)}</span>
       <b>${esc(r.user && r.user.name)}</b><br>${esc(r.comment)}${user && r.user && r.user.id === user.id ? ` <button class="btn red sm" onclick="delReview(${r.id})">Delete</button>` : ""}</p>`).join("") : `<p class="mu">No reviews yet.</p>`}
       ${user ? `<hr><form class="f" id="rf"><select id="rr">${[5, 4, 3, 2, 1].map(n => `<option value="${n}">${n} ★</option>`).join("")}</select>
@@ -364,7 +378,7 @@ async function productPage(id) {
 }
 
 async function cartPage() {
-    if (!user) return (location.hash = "#/login");
+    if (!user) { toast("Please log in to view your cart", true); return (location.hash = "#/login"); }
     if (user.role === "SUPPLIER") { toast("Cart is available to customer accounts only.", true); location.hash = "#/manage"; return; }
     const draw = async () => {
         const items = await cartItems();
@@ -385,7 +399,7 @@ async function cartPage() {
 }
 
 async function ordersPage() {
-    if (!user) return (location.hash = "#/login");
+    if (!user) { toast("Please log in to view your orders", true); return (location.hash = "#/login"); }
     if (user.role === "SUPPLIER") { toast("Supplier order management is not available on this page yet.", true); location.hash = "#/manage"; return; }
     const orders = (await api(`/orders/user/${user.id}`)).reverse();
     const withItems = await Promise.all(orders.map(async o => ({ ...o, items: await api(`/order-items/order/${o.id}`) })));
@@ -396,7 +410,7 @@ async function ordersPage() {
 }
 
 async function supplierOrdersPage() {
-    if (!user) return (location.hash = "#/login");
+    if (!user) { toast("Please log in first", true); return (location.hash = "#/login"); }
     if (user.role !== "SUPPLIER") { toast("Supplier accounts only.", true); return (location.hash = "#/manage"); }
     const orders = await api(`/supplier-portal/${user.id}/orders`);
     view(`<h1>Supplier Orders</h1><p class="mu">Orders that contain products supplied by your account.</p>` +

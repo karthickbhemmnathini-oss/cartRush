@@ -44,6 +44,10 @@ class ShoppingAssistantServiceTest {
     @Mock
     private com.example.cart_rush.repository.OrderItemRepository orderItemRepository;
     @Mock
+    private com.example.cart_rush.repository.SupplierRepository supplierRepository;
+    @Mock
+    private com.example.cart_rush.repository.UserRepository userRepository;
+    @Mock
     private ShoppingIntentProvider intentProvider;
     @Mock
     private GeminiClient geminiClient;
@@ -54,7 +58,7 @@ class ShoppingAssistantServiceTest {
     @BeforeEach
     void setUp() {
         service = new ShoppingAssistantService(productRepository, reviewRepository,
-            cartRepository, cartItemRepository, orderRepository, orderItemRepository,
+            cartRepository, cartItemRepository, orderRepository, orderItemRepository, supplierRepository, userRepository,
             intentProvider, geminiClient, new ShoppingIntentFallbackParser());
         trailShoes = product(1L, "Trail Shoe", "NorthPeak", "Footwear", "Trail-ready hiking footwear", "120.00", true);
     }
@@ -281,6 +285,60 @@ class ShoppingAssistantServiceTest {
     }
 
     @Test
+    void fallbackRecognizesVagueTripRequestAndAsksForClarification() {
+        when(intentProvider.analyze("something for a trip", List.of()))
+            .thenThrow(new IllegalStateException("provider unavailable"));
+
+        List<AssistantStreamEvent> events = new ArrayList<>();
+        service.streamChat(new AssistantChatRequest("something for a trip", List.of()), events::add);
+
+        AssistantChatResponse response = events.get(events.size() - 1).response();
+        assertEquals(AssistantIntent.SHOPPING_VAGUE.name(), events.get(0).intent());
+        assertEquals("FALLBACK", response.source());
+        assertTrue(response.products().isEmpty());
+        assertTrue(response.reply().contains("What type of product"));
+    }
+
+        @Test
+        void categorySelectionCarriesIntoRatingFilterFollowup() {
+        Product accessory = product(22L, "Trail Compass", "NorthPeak", "Accessories", "Navigation accessory", "40.00", false);
+        when(productRepository.findAll()).thenReturn(List.of(accessory));
+        when(reviewRepository.findAll()).thenReturn(List.of());
+
+        AssistantAnalysis selectedCategory = service.classifyLocally("accessories");
+        assertEquals(AssistantIntent.SHOPPING_CLEAR, selectedCategory.intent());
+        assertEquals("Accessories", selectedCategory.filters().category());
+
+        List<AssistantChatRequest.ChatTurn> history = List.of(
+            new AssistantChatRequest.ChatTurn("user", "categories in the store please"),
+            new AssistantChatRequest.ChatTurn("assistant", "Our catalogue categories include Accessories."),
+            new AssistantChatRequest.ChatTurn("user", "accessories"),
+            new AssistantChatRequest.ChatTurn("assistant", "Showing accessories."));
+
+        AssistantAnalysis clarification = service.classifyLocally("filter by rating", history);
+        assertEquals(AssistantIntent.SHOPPING_VAGUE, clarification.intent());
+        assertEquals("Accessories", clarification.filters().category());
+        assertTrue(clarification.clarification().contains("rating"));
+
+        AssistantAnalysis ratedFollowup = service.classifyLocally("4 stars", history);
+        assertEquals(AssistantIntent.SHOPPING_CLEAR, ratedFollowup.intent());
+        assertEquals("Accessories", ratedFollowup.filters().category());
+        assertEquals(4, ratedFollowup.filters().minRating());
+
+        when(intentProvider.analyze("4 stars", history))
+            .thenThrow(new IllegalStateException("provider unavailable"));
+        List<AssistantStreamEvent> events = new ArrayList<>();
+        service.streamChat(new AssistantChatRequest("4 stars", history), events::add);
+
+        AssistantChatResponse response = events.get(events.size() - 1).response();
+        assertEquals(AssistantIntent.SHOPPING_CLEAR.name(), events.get(0).intent());
+        assertEquals("Accessories", response.filters().category());
+        assertEquals(4, response.filters().minRating());
+        assertEquals(List.of("Trail Compass"), response.products().stream()
+            .map(AssistantChatResponse.ProductMatch::name).toList());
+        }
+
+    @Test
     void reportsHttpStatusCodeWhenGeminiRejectsRequest() {
         when(intentProvider.analyze("hi", List.of()))
             .thenThrow(new com.google.genai.errors.ClientException(400, "INVALID_ARGUMENT", "API key not valid"));
@@ -320,6 +378,7 @@ class ShoppingAssistantServiceTest {
                 product(4L, "Day Pack", "Wayfarer", "Bags", "Light pack", "50.00", false), 1);
         when(intentProvider.analyze("show my cart", List.of()))
                 .thenReturn(new AssistantAnalysis(AssistantIntent.ACCOUNT_CART, ShoppingIntent.empty(), null));
+        when(userRepository.findById(7L)).thenReturn(java.util.Optional.of(customer));
         when(cartRepository.findByUserId(7L)).thenReturn(java.util.Optional.of(cart));
         when(cartItemRepository.findByCartId(3L)).thenReturn(List.of(first, second));
 
@@ -346,6 +405,7 @@ class ShoppingAssistantServiceTest {
         OrderItem item = new OrderItem(order, trailShoes, 2);
         when(intentProvider.analyze("show my previous purchased products", List.of()))
                 .thenReturn(new AssistantAnalysis(AssistantIntent.ACCOUNT_ORDERS, ShoppingIntent.empty(), null));
+        when(userRepository.findById(7L)).thenReturn(java.util.Optional.of(customer));
         when(orderRepository.findByUserId(7L)).thenReturn(List.of(order));
         when(orderItemRepository.findByOrderId(9L)).thenReturn(List.of(item));
 
@@ -360,6 +420,56 @@ class ShoppingAssistantServiceTest {
         assertEquals("Trail Shoe", response.orders().get(0).items().get(0).name());
         assertTrue(response.reply().contains("1 order"));
         assertFalse(response.replyGeneratedByAi());
+    }
+
+    @Test
+    void customerCanFilterOwnOrdersByStatusInFallback() {
+        User customer = new User("Asha", "asha@example.com", "pw", "CUSTOMER");
+        customer.setId(7L);
+        Order delivered = new Order(customer, "DELIVERED");
+        delivered.setId(20L);
+        Order shipped = new Order(customer, "SHIPPED");
+        shipped.setId(21L);
+        Order anotherUsersDelivered = new Order(new User("Other", "other@example.com", "pw", "CUSTOMER"), "DELIVERED");
+        anotherUsersDelivered.setId(22L);
+        when(userRepository.findById(7L)).thenReturn(java.util.Optional.of(customer));
+        when(intentProvider.analyze("show delivered orders", List.of()))
+                .thenThrow(new IllegalStateException("Gemini unavailable"));
+        when(orderRepository.findByUserId(7L)).thenReturn(List.of(delivered, shipped));
+        when(orderItemRepository.findByOrderId(20L)).thenReturn(List.of(new OrderItem(delivered, trailShoes, 1)));
+
+        List<AssistantStreamEvent> events = new ArrayList<>();
+        service.streamChat(new AssistantChatRequest("show delivered orders", List.of(), 7L), events::add);
+
+        AssistantChatResponse response = events.get(events.size() - 1).response();
+        assertEquals(AssistantIntent.ACCOUNT_ORDERS.name(), events.get(0).intent());
+        assertEquals(List.of(20L), response.orders().stream().map(AssistantChatResponse.OrderView::id).toList());
+        assertTrue(response.reply().contains("1 delivered order"));
+        assertEquals("FALLBACK", response.source());
+        verify(orderRepository).findByUserId(7L);
+        verify(orderItemRepository).findByOrderId(20L);
+        verify(orderItemRepository, never()).findByOrderId(21L);
+    }
+
+    @Test
+    void orderArrivalQuestionReportsStoredStatusWithoutInventingEta() {
+        User customer = new User("Asha", "asha@example.com", "pw", "CUSTOMER");
+        customer.setId(7L);
+        Order shipped = new Order(customer, "SHIPPED");
+        shipped.setId(31L);
+        when(userRepository.findById(7L)).thenReturn(java.util.Optional.of(customer));
+        when(intentProvider.analyze("when will my order arrive", List.of()))
+                .thenThrow(new IllegalStateException("Gemini unavailable"));
+        when(orderRepository.findByUserId(7L)).thenReturn(List.of(shipped));
+        when(orderItemRepository.findByOrderId(31L)).thenReturn(List.of());
+
+        List<AssistantStreamEvent> events = new ArrayList<>();
+        service.streamChat(new AssistantChatRequest("when will my order arrive", List.of(), 7L), events::add);
+
+        AssistantChatResponse response = events.get(events.size() - 1).response();
+        assertEquals(AssistantIntent.ACCOUNT_ORDERS.name(), events.get(0).intent());
+        assertTrue(response.reply().contains("Order #31 is shipped"));
+        assertFalse(response.reply().toLowerCase().contains("arrive on"));
     }
 
     @Test
@@ -378,6 +488,22 @@ class ShoppingAssistantServiceTest {
     }
 
     @Test
+    void supplierCannotReadCustomerCartEvenWhenSendingCustomerId() {
+        User supplierUser = new User("Vendor", "vendor@example.com", "pw", "SUPPLIER");
+        supplierUser.setId(9L);
+        when(intentProvider.analyze("show my cart", List.of()))
+                .thenReturn(new AssistantAnalysis(AssistantIntent.ACCOUNT_CART, ShoppingIntent.empty(), null));
+        when(userRepository.findById(9L)).thenReturn(java.util.Optional.of(supplierUser));
+
+        List<AssistantStreamEvent> events = new ArrayList<>();
+        service.streamChat(new AssistantChatRequest("show my cart", List.of(), 9L), events::add);
+
+        AssistantChatResponse response = events.get(events.size() - 1).response();
+        assertTrue(response.reply().contains("log in to your customer account"));
+        verify(cartRepository, never()).findByUserId(org.mockito.Mockito.anyLong());
+    }
+
+    @Test
     void localFallbackRecognizesCartAndOrderPhrases() {
         when(intentProvider.analyze(org.mockito.Mockito.anyString(), org.mockito.Mockito.anyList()))
                 .thenThrow(new IllegalStateException("provider unavailable"));
@@ -390,6 +516,133 @@ class ShoppingAssistantServiceTest {
         List<AssistantStreamEvent> orderEvents = new ArrayList<>();
         service.streamChat(new AssistantChatRequest("show my previous purchased products", List.of()), orderEvents::add);
         assertEquals(AssistantIntent.ACCOUNT_ORDERS.name(), orderEvents.get(0).intent());
+    }
+
+        @Test
+        void fallbackListsOnlyCategoriesPresentInCatalogue() {
+        when(productRepository.findAll()).thenReturn(List.of(trailShoes,
+            product(2L, "Trail Pack", "Wayfarer", "Bags", "Pack", "70.00", false)));
+        when(intentProvider.analyze("what categories do you have", List.of()))
+            .thenThrow(new IllegalStateException("provider unavailable"));
+
+        List<AssistantStreamEvent> events = new ArrayList<>();
+        service.streamChat(new AssistantChatRequest("what categories do you have", List.of()), events::add);
+
+        AssistantChatResponse response = events.get(events.size() - 1).response();
+        assertEquals(AssistantIntent.CATALOGUE_CATEGORIES.name(), events.get(0).intent());
+        assertEquals(List.of("Bags", "Footwear"), response.categories());
+        assertTrue(response.reply().contains("Bags, Footwear"));
+        }
+
+        @Test
+        void fallbackProductInfoUsesCatalogueFacts() {
+        when(productRepository.findAll()).thenReturn(List.of(trailShoes));
+        when(reviewRepository.findAll()).thenReturn(List.of());
+        when(intentProvider.analyze("tell me details about Trail Shoe", List.of()))
+            .thenThrow(new IllegalStateException("provider unavailable"));
+
+        List<AssistantStreamEvent> events = new ArrayList<>();
+        service.streamChat(new AssistantChatRequest("tell me details about Trail Shoe", List.of()), events::add);
+
+        AssistantChatResponse response = events.get(events.size() - 1).response();
+        assertEquals(AssistantIntent.PRODUCT_INFO.name(), events.get(0).intent());
+        assertEquals(1, response.products().size());
+        assertEquals("Trail Shoe", response.products().get(0).name());
+        assertTrue(response.reply().contains("120.00"));
+        assertTrue(response.reply().contains("in stock"));
+        }
+
+        @Test
+        void fallbackProductReviewSummaryUsesStoredReviews() {
+        var review = new com.example.cart_rush.entity.Review(
+            new User("Asha", "asha@example.com", "pw", "CUSTOMER"), trailShoes, 5, "Comfortable");
+        when(productRepository.findAll()).thenReturn(List.of(trailShoes));
+        when(reviewRepository.findByProductId(1L)).thenReturn(List.of(review));
+        when(intentProvider.analyze("show reviews for Trail Shoe", List.of()))
+            .thenThrow(new IllegalStateException("provider unavailable"));
+
+        List<AssistantStreamEvent> events = new ArrayList<>();
+        service.streamChat(new AssistantChatRequest("show reviews for Trail Shoe", List.of()), events::add);
+
+        AssistantChatResponse response = events.get(events.size() - 1).response();
+        assertEquals(AssistantIntent.PRODUCT_REVIEWS.name(), events.get(0).intent());
+        assertEquals(1, response.reviews().size());
+        assertEquals(5.0, response.reviews().get(0).averageRating());
+        assertTrue(response.reply().contains("5.0 out of 5"));
+        }
+
+        @Test
+        void fallbackDoesNotInventRewardsProgram() {
+        when(intentProvider.analyze("how many reward points do i have", List.of()))
+            .thenThrow(new IllegalStateException("provider unavailable"));
+
+        List<AssistantStreamEvent> events = new ArrayList<>();
+        service.streamChat(new AssistantChatRequest("how many reward points do i have", List.of()), events::add);
+
+        AssistantChatResponse response = events.get(events.size() - 1).response();
+        assertEquals(AssistantIntent.REWARDS_INFO.name(), events.get(0).intent());
+        assertTrue(response.reply().contains("does not currently have a rewards or points program"));
+        assertFalse(response.replyGeneratedByAi());
+        }
+
+    @Test
+    void customerCannotReadSupplierInventoryOrAdminOverview() {
+        User customer = new User("Asha", "asha@example.com", "pw", "CUSTOMER");
+        customer.setId(7L);
+        when(intentProvider.analyze("show my inventory", List.of()))
+                .thenReturn(new AssistantAnalysis(AssistantIntent.SUPPLIER_INVENTORY, ShoppingIntent.empty(), null));
+        when(userRepository.findById(7L)).thenReturn(java.util.Optional.of(customer));
+
+        List<AssistantStreamEvent> events = new ArrayList<>();
+        service.streamChat(new AssistantChatRequest("show my inventory", List.of(), 7L), events::add);
+
+        AssistantChatResponse response = events.get(events.size() - 1).response();
+        assertTrue(response.reply().contains("only to the appropriate signed-in supplier or admin"));
+        verify(supplierRepository, never()).findByUserId(7L);
+        verify(productRepository, never()).findBySupplierId(org.mockito.Mockito.anyLong());
+    }
+
+    @Test
+    void supplierInventorySummaryUsesOnlySuppliersOwnProducts() {
+        User supplierUser = new User("Vendor", "vendor@example.com", "pw", "SUPPLIER");
+        supplierUser.setId(9L);
+        com.example.cart_rush.entity.Supplier supplier = new com.example.cart_rush.entity.Supplier("Vendor Co", "", "", supplierUser);
+        supplier.setId(3L);
+        when(intentProvider.analyze("show my inventory", List.of()))
+                .thenReturn(new AssistantAnalysis(AssistantIntent.SUPPLIER_INVENTORY, ShoppingIntent.empty(), null));
+        when(userRepository.findById(9L)).thenReturn(java.util.Optional.of(supplierUser));
+        when(supplierRepository.findByUserId(9L)).thenReturn(java.util.Optional.of(supplier));
+        when(productRepository.findBySupplierId(3L)).thenReturn(List.of(trailShoes));
+
+        List<AssistantStreamEvent> events = new ArrayList<>();
+        service.streamChat(new AssistantChatRequest("show my inventory", List.of(), 9L), events::add);
+
+        AssistantChatResponse response = events.get(events.size() - 1).response();
+        assertEquals(AssistantIntent.SUPPLIER_INVENTORY.name(), events.get(0).intent());
+        assertEquals("Your supplier catalogue has 1 products; 0 are low on stock.", response.reply());
+        verify(productRepository).findBySupplierId(3L);
+    }
+
+    @Test
+    void adminGetsStoreWideReadOnlySummary() {
+        User admin = new User("Admin", "admin@example.com", "pw", "ADMIN");
+        admin.setId(1L);
+        when(intentProvider.analyze("show store overview", List.of()))
+                .thenReturn(new AssistantAnalysis(AssistantIntent.ADMIN_OVERVIEW, ShoppingIntent.empty(), null));
+        when(userRepository.findById(1L)).thenReturn(java.util.Optional.of(admin));
+        when(productRepository.count()).thenReturn(12L);
+        when(orderRepository.count()).thenReturn(8L);
+        when(userRepository.count()).thenReturn(4L);
+        when(supplierRepository.count()).thenReturn(2L);
+        when(reviewRepository.count()).thenReturn(6L);
+
+        List<AssistantStreamEvent> events = new ArrayList<>();
+        service.streamChat(new AssistantChatRequest("show store overview", List.of(), 1L), events::add);
+
+        AssistantChatResponse response = events.get(events.size() - 1).response();
+        assertEquals(AssistantIntent.ADMIN_OVERVIEW.name(), events.get(0).intent());
+        assertTrue(response.reply().contains("12 products, 8 orders, 4 users, 2 suppliers, and 6 reviews"));
+        assertFalse(response.replyGeneratedByAi());
     }
 
     @Test

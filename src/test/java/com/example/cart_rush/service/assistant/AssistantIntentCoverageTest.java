@@ -11,10 +11,13 @@ import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 
 import java.math.BigDecimal;
+import java.io.BufferedReader;
+import java.io.InputStreamReader;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Set;
 import java.util.stream.Collectors;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -55,7 +58,7 @@ class AssistantIntentCoverageTest {
     @BeforeEach
     void setUp() {
         service = new ShoppingAssistantService(productRepository, reviewRepository,
-                null, null, null, null,
+            null, null, null, null, null, null,
                 intentProvider, geminiClient, new ShoppingIntentFallbackParser());
         lenient().when(productRepository.findAll()).thenReturn(CATALOGUE);
         lenient().when(reviewRepository.findAll()).thenReturn(List.of());
@@ -140,6 +143,42 @@ class AssistantIntentCoverageTest {
     }
 
     @Test
+    void categoryRatingFollowupKeepsTheSelectedCategory() {
+        org.mockito.Mockito.when(productRepository.findAll()).thenReturn(List.of(
+            product(8L, "Trail Compass", "NorthPeak", "Accessories", "Navigation accessory", "40.00", 20, false)));
+        List<AssistantChatRequest.ChatTurn> history = List.of(
+                new AssistantChatRequest.ChatTurn("user", "categories in the store please"),
+                new AssistantChatRequest.ChatTurn("assistant", "Our catalogue categories include Accessories."),
+                new AssistantChatRequest.ChatTurn("user", "accessories"),
+                new AssistantChatRequest.ChatTurn("assistant", "Showing accessories."));
+
+        AssistantAnalysis analysis = service.classifyLocally("4 stars", history);
+
+        assertEquals(AssistantIntent.SHOPPING_CLEAR, analysis.intent());
+        assertEquals("Accessories", analysis.filters().category());
+        assertEquals(4, analysis.filters().minRating());
+    }
+
+    @Test
+    void generatedRoleMatrixHasTwoThousandCasesForBothModes() throws Exception {
+        try (var stream = getClass().getResourceAsStream("/assistant-fallback-messages.csv")) {
+            assertNotNull(stream, "generated assistant test CSV must be on the test classpath");
+            List<String> rows;
+            try (var reader = new BufferedReader(new InputStreamReader(stream, java.nio.charset.StandardCharsets.UTF_8))) {
+                rows = reader.lines().skip(1).filter(line -> !line.isBlank()).toList();
+            }
+            assertEquals(2000, rows.size());
+                List<String> roles = rows.stream().map(line -> line.split(",", 4)[0].replace("\"", "")).toList();
+                assertTrue(Set.of("ANY", "CUSTOMER", "SUPPLIER", "ADMIN").containsAll(roles.stream().distinct().toList()));
+                assertTrue(roles.stream().filter("ANY"::equals).count() > 0);
+                assertTrue(roles.stream().filter("CUSTOMER"::equals).count() > 0);
+                assertTrue(roles.stream().filter("SUPPLIER"::equals).count() > 0);
+                assertTrue(roles.stream().filter("ADMIN"::equals).count() > 0);
+            assertTrue(rows.stream().allMatch(line -> line.contains("GEMINI_AND_FALLBACK")));
+        }
+    }
+
+    @Test
     void streamingFirstEventIsEmittedImmediatelyForEveryRoute() {
         // Prove real-time behavior at the service level: the very first SSE event
         // (status) must arrive synchronously, before any network call resolves.
@@ -164,6 +203,59 @@ class AssistantIntentCoverageTest {
             assertTrue(elapsedMs < 2000, () -> "first event too slow (" + elapsedMs + "ms) for: " + message);
         }
     }
+
+        @Test
+        void routesOneThousandFallbackQuestionsAcrossSupportedDomains() {
+        String[] commonSuffixes = {"", " please", " now", " please now", " for me", " thanks",
+            " today", " now please", " if you can", " thanks please"};
+        String[] greetingSuffixes = {"", "!", ".", " there", " there!", " friend", " friend!",
+            " everyone", " all", " folks"};
+        List<String> questions = new ArrayList<>();
+        List<AssistantIntent> expectedIntents = new ArrayList<>();
+
+        addQuestionFamily(questions, expectedIntents, AssistantIntent.GREETING,
+            variants(new String[]{"hi", "hello", "hey", "good morning", "good afternoon", "good evening", "howdy", "greetings", "welcome", "good day"}, greetingSuffixes));
+        addQuestionFamily(questions, expectedIntents, AssistantIntent.CATALOGUE_CATEGORIES,
+            variants(new String[]{"list product categories", "show categories", "what categories do you have", "which categories are available", "browse product categories", "tell me the categories", "show me store categories", "list the types of products", "what product categories exist", "categories in the store"}, commonSuffixes));
+        addQuestionFamily(questions, expectedIntents, AssistantIntent.PRODUCT_INFO,
+            variants(new String[]{"tell me details about Summit Waterproof Watch", "what is Summit Waterproof Watch", "show details for Summit Waterproof Watch", "give me information about Summit Waterproof Watch", "describe Summit Waterproof Watch", "what is the price of Summit Waterproof Watch", "is Summit Waterproof Watch in stock", "tell me about Summit Waterproof Watch", "show Summit Waterproof Watch information", "what category is Summit Waterproof Watch"}, commonSuffixes));
+        addQuestionFamily(questions, expectedIntents, AssistantIntent.PRODUCT_REVIEWS,
+            variants(new String[]{"show reviews for Summit Waterproof Watch", "read reviews for Summit Waterproof Watch", "what are the reviews of Summit Waterproof Watch", "average rating for Summit Waterproof Watch", "show ratings for Summit Waterproof Watch", "summarize reviews about Summit Waterproof Watch", "how is Summit Waterproof Watch rated", "what do reviews say about Summit Waterproof Watch", "rating of Summit Waterproof Watch", "reviews on Summit Waterproof Watch"}, commonSuffixes));
+        addQuestionFamily(questions, expectedIntents, AssistantIntent.REWARDS_INFO,
+            variants(new String[]{"do i have rewards", "show my reward points", "how many loyalty points do i have", "tell me about rewards", "what rewards can i get", "check my points", "do you offer loyalty rewards", "show reward balance", "how does the points program work", "where are my rewards"}, commonSuffixes));
+        addQuestionFamily(questions, expectedIntents, AssistantIntent.SHOPPING_CLEAR,
+            variants(new String[]{"show watches under 500", "find bags below 200", "search jackets under 1000", "buy shoes below 1500", "recommend a watch under 300", "show waterproof watches under 500", "find bags over 100", "show watches between 50 and 200", "search products under 1000", "find waterproof jackets below 500"}, commonSuffixes));
+        addQuestionFamily(questions, expectedIntents, AssistantIntent.SHOPPING_CLEAR,
+            variants(new String[]{"show watches rated 4 stars", "find bags rated 5 stars", "show 4 star watches", "top rated jackets", "show watches with 5 star rating", "find highly rated shoes", "show products rated 4 stars", "best rated bags", "waterproof watches rated 4 stars", "show footwear with 5 stars"}, commonSuffixes));
+        addQuestionFamily(questions, expectedIntents, AssistantIntent.ACCOUNT_CART,
+            variants(new String[]{"show my cart", "view my cart", "what is in my cart", "check my cart", "show my basket", "open my basket", "cart contents", "what is in the basket", "let me see my cart", "display my shopping basket"}, commonSuffixes));
+        addQuestionFamily(questions, expectedIntents, AssistantIntent.ACCOUNT_ORDERS,
+            variants(new String[]{"show my orders", "my order history", "show my previous purchases", "what i bought", "what have i purchased", "show my purchase history", "previous orders", "list my orders", "show my past purchases", "my purchases"}, commonSuffixes));
+        addQuestionFamily(questions, expectedIntents, AssistantIntent.SHOPPING_VAGUE,
+            variants(new String[]{"something for a trip", "something for a gift", "i need something", "help me choose a product", "looking for something", "need a present", "shopping for travel", "i want a gift", "recommend something", "help me find gear"}, commonSuffixes));
+
+        assertEquals(1000, questions.size(), "the generated evaluation matrix must contain exactly 1,000 questions");
+        for (int index = 0; index < questions.size(); index++) {
+            String question = questions.get(index);
+            AssistantIntent expectedIntent = expectedIntents.get(index);
+            AssistantIntent actual = service.classifyLocally(question).intent();
+            assertEquals(expectedIntent, actual, "Question " + index + " misrouted: " + question);
+        }
+    }
+
+    private static void addQuestionFamily(List<String> questions, List<AssistantIntent> expected,
+                                          AssistantIntent intent, List<String> family) {
+        questions.addAll(family);
+        for (int index = 0; index < family.size(); index++) expected.add(intent);
+    }
+
+        private static List<String> variants(String[] templates, String[] suffixes) {
+        List<String> questions = new ArrayList<>(templates.length * suffixes.length);
+        for (String template : templates) {
+            for (String suffix : suffixes) questions.add(template + suffix);
+        }
+        return questions;
+        }
 
     // ---- classifiers exercised through the real streamChat path in fallback mode ----
 
@@ -253,7 +345,8 @@ class AssistantIntentCoverageTest {
                 "show my orders", "my orders", "order history", "my order history",
                 "show my previous orders", "show my previous purchases", "my purchases",
                 "what i bought", "what i purchased", "show what i bought",
-                "my previous purchased products", "show my purchase history"
+                "my previous purchased products", "show my purchase history",
+                "when will my order arrive"
         };
         List<String> out = new ArrayList<>();
         for (String template : templates) {
@@ -268,7 +361,7 @@ class AssistantIntentCoverageTest {
         String[] templates = {
                 "what is waterproofing", "how do i wash a waterproof jacket", "what does gps mean",
                 "why choose a rolltop bag", "how long does delivery take", "where do you ship",
-                "when will my order arrive", "which watch is best for swimming"
+                "which watch is best for swimming"
         };
         List<String> out = new ArrayList<>();
         for (String template : templates) {

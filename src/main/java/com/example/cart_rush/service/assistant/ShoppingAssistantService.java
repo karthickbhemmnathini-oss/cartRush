@@ -6,12 +6,15 @@ import com.example.cart_rush.entity.Order;
 import com.example.cart_rush.entity.OrderItem;
 import com.example.cart_rush.entity.Product;
 import com.example.cart_rush.entity.Review;
+import com.example.cart_rush.entity.User;
 import com.example.cart_rush.repository.CartItemRepository;
 import com.example.cart_rush.repository.CartRepository;
 import com.example.cart_rush.repository.OrderItemRepository;
 import com.example.cart_rush.repository.OrderRepository;
 import com.example.cart_rush.repository.ProductRepository;
 import com.example.cart_rush.repository.ReviewRepository;
+import com.example.cart_rush.repository.SupplierRepository;
+import com.example.cart_rush.repository.UserRepository;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
@@ -42,6 +45,8 @@ public class ShoppingAssistantService {
     private final CartItemRepository cartItemRepository;
     private final OrderRepository orderRepository;
     private final OrderItemRepository orderItemRepository;
+    private final SupplierRepository supplierRepository;
+    private final UserRepository userRepository;
     private final ShoppingIntentProvider intentProvider;
     private final GeminiClient geminiClient;
     private final ShoppingIntentFallbackParser fallbackParser;
@@ -52,6 +57,8 @@ public class ShoppingAssistantService {
                                     CartItemRepository cartItemRepository,
                                     OrderRepository orderRepository,
                                     OrderItemRepository orderItemRepository,
+                                    SupplierRepository supplierRepository,
+                                    UserRepository userRepository,
                                     ShoppingIntentProvider intentProvider,
                                     GeminiClient geminiClient,
                                     ShoppingIntentFallbackParser fallbackParser) {
@@ -61,6 +68,8 @@ public class ShoppingAssistantService {
         this.cartItemRepository = cartItemRepository;
         this.orderRepository = orderRepository;
         this.orderItemRepository = orderItemRepository;
+        this.supplierRepository = supplierRepository;
+        this.userRepository = userRepository;
         this.intentProvider = intentProvider;
         this.geminiClient = geminiClient;
         this.fallbackParser = fallbackParser;
@@ -94,9 +103,13 @@ public class ShoppingAssistantService {
             source = "GEMINI";
         } catch (RuntimeException exception) {
             fallbackReason = classifyProviderFailure(exception);
-            log.warn("Gemini intent classification failed ({}: {}); selecting local response path",
-                    fallbackReason, exception.getMessage());
-            analysis = classifyLocally(message);
+            Throwable rootCause = exception;
+            while (rootCause.getCause() != null) {
+                rootCause = rootCause.getCause();
+            }
+            log.warn("Gemini intent classification failed ({}; root cause type: {}); selecting local response path",
+                    fallbackReason, rootCause.getClass().getSimpleName());
+            analysis = classifyLocally(message, request.history());
             source = "FALLBACK";
         }
 
@@ -128,7 +141,31 @@ public class ShoppingAssistantService {
             return;
         }
         if (intent == AssistantIntent.ACCOUNT_ORDERS) {
-            streamOrdersReply(request.userId(), source, fallbackReason, events);
+            streamOrdersReply(request.userId(), message, source, fallbackReason, events);
+            return;
+        }
+        if (intent == AssistantIntent.SUPPLIER_INVENTORY || intent == AssistantIntent.SUPPLIER_ORDERS
+                || intent.name().startsWith("ADMIN_")) {
+            streamRoleSummary(request.userId(), intent, source, fallbackReason, events);
+            return;
+        }
+        if (intent == AssistantIntent.CATALOGUE_CATEGORIES) {
+            streamCategoriesReply(source, fallbackReason, events);
+            return;
+        }
+        if (intent == AssistantIntent.PRODUCT_INFO) {
+            streamProductInfoReply(message, source, fallbackReason, events);
+            return;
+        }
+        if (intent == AssistantIntent.PRODUCT_REVIEWS) {
+            streamProductReviewsReply(message, source, fallbackReason, events);
+            return;
+        }
+        if (intent == AssistantIntent.REWARDS_INFO) {
+            String reply = "Cart Rush does not currently have a rewards or points program. I can help with products, reviews, your cart, and your orders.";
+            events.accept(AssistantStreamEvent.token(reply, intent.name()));
+            events.accept(AssistantStreamEvent.finalResponse(new AssistantChatResponse(reply, List.of(),
+                    ShoppingIntent.empty(), source, "GEMINI".equals(source), false, fallbackReason), intent.name()));
             return;
         }
         if (intent == AssistantIntent.SHOPPING_VAGUE) {
@@ -145,9 +182,6 @@ public class ShoppingAssistantService {
         List<Product> catalogue = productRepository.findAll();
         ShoppingIntent supplementalFilters = fallbackParser.parse(message, catalogue);
         ShoppingIntent filters = mergeFilters(analysis.filters(), supplementalFilters);
-        if ("FALLBACK".equals(source)) {
-            filters = normalize(supplementalFilters);
-        }
         ShoppingIntent resolvedFilters = filters;
         Map<Long, Rating> ratings = readRatings();
         List<AssistantChatResponse.ProductMatch> matches = catalogue.stream()
@@ -251,13 +285,161 @@ public class ShoppingAssistantService {
             case SHOPPING_VAGUE -> "Understanding your request";
             case ACCOUNT_CART -> "Checking your cart";
             case ACCOUNT_ORDERS -> "Checking your orders";
+                case CATALOGUE_CATEGORIES -> "Checking store categories";
+                case PRODUCT_INFO -> "Looking up product details";
+                case PRODUCT_REVIEWS -> "Checking product reviews";
+                case REWARDS_INFO -> "Checking rewards information";
+                case SUPPLIER_INVENTORY, SUPPLIER_ORDERS -> "Checking supplier information";
+                case ADMIN_OVERVIEW, ADMIN_ORDERS, ADMIN_REVIEWS, ADMIN_USERS, ADMIN_SUPPLIERS -> "Checking store information";
         };
     }
+
+        private void streamRoleSummary(Long userId, AssistantIntent intent, String source, String fallbackReason,
+                                       Consumer<AssistantStreamEvent> events) {
+            String role = userId == null ? "GUEST" : userRepository.findById(userId)
+                    .map(user -> user.getRole() == null ? "GUEST" : user.getRole().toUpperCase(Locale.ROOT))
+                    .orElse("GUEST");
+            boolean supplierAllowed = "SUPPLIER".equals(role)
+                    && (intent == AssistantIntent.SUPPLIER_INVENTORY || intent == AssistantIntent.SUPPLIER_ORDERS);
+            boolean adminAllowed = "ADMIN".equals(role) && intent.name().startsWith("ADMIN_");
+            if (!supplierAllowed && !adminAllowed) {
+                String reply = "That information is available only to the appropriate signed-in supplier or admin account.";
+                emitLocalReply(reply, intent, source, fallbackReason, events);
+                return;
+            }
+
+            String reply;
+            if (supplierAllowed) {
+                var supplier = supplierRepository.findByUserId(userId).orElse(null);
+                if (supplier == null) {
+                    reply = "I couldn’t find a supplier profile linked to this account.";
+                } else if (intent == AssistantIntent.SUPPLIER_INVENTORY) {
+                    List<Product> products = productRepository.findBySupplierId(supplier.getId());
+                    int lowStock = (int) products.stream().filter(product -> product.getStock() != null && product.getStock() <= 10).count();
+                    reply = "Your supplier catalogue has " + products.size() + " products; " + lowStock + " are low on stock.";
+                } else {
+                    long orderCount = orderItemRepository.findAll().stream()
+                            .filter(item -> item.getProduct() != null && item.getProduct().getSupplier() != null
+                                    && java.util.Objects.equals(item.getProduct().getSupplier().getId(), supplier.getId()))
+                            .map(item -> item.getOrder().getId()).distinct().count();
+                    reply = "Your products appear in " + orderCount + " customer orders.";
+                }
+            } else {
+                reply = switch (intent) {
+                    case ADMIN_OVERVIEW -> "Store overview: " + productRepository.count() + " products, "
+                            + orderRepository.count() + " orders, " + userRepository.count() + " users, "
+                            + supplierRepository.count() + " suppliers, and " + reviewRepository.count() + " reviews.";
+                    case ADMIN_ORDERS -> "There are " + orderRepository.count() + " orders in the store.";
+                    case ADMIN_REVIEWS -> "There are " + reviewRepository.count() + " product reviews in the store.";
+                    case ADMIN_USERS -> "There are " + userRepository.count() + " user accounts in the store.";
+                    case ADMIN_SUPPLIERS -> "There are " + supplierRepository.count() + " supplier accounts in the store.";
+                    default -> "I can provide read-only store summaries for admins.";
+                };
+            }
+            emitLocalReply(reply, intent, source, fallbackReason, events);
+        }
+
+        private static void emitLocalReply(String reply, AssistantIntent intent, String source, String fallbackReason,
+                                           Consumer<AssistantStreamEvent> events) {
+            events.accept(AssistantStreamEvent.token(reply, intent.name()));
+            events.accept(AssistantStreamEvent.finalResponse(new AssistantChatResponse(reply, List.of(),
+                    ShoppingIntent.empty(), source, "GEMINI".equals(source), false, fallbackReason), intent.name()));
+        }
+
+            private void streamCategoriesReply(String source, String fallbackReason,
+                               Consumer<AssistantStreamEvent> events) {
+            List<String> categories = productRepository.findAll().stream()
+                .map(Product::getCategory)
+                .filter(java.util.Objects::nonNull)
+                .map(com.example.cart_rush.entity.Category::getName)
+                .filter(value -> value != null && !value.isBlank())
+                .distinct()
+                .sorted(String.CASE_INSENSITIVE_ORDER)
+                .toList();
+            String reply = categories.isEmpty()
+                ? "I can’t find any product categories in the catalogue right now."
+                : "Our catalogue categories are: " + String.join(", ", categories) + ".";
+            events.accept(AssistantStreamEvent.token(reply, AssistantIntent.CATALOGUE_CATEGORIES.name()));
+            events.accept(AssistantStreamEvent.finalResponse(new AssistantChatResponse(reply, List.of(),
+                ShoppingIntent.empty(), source, "GEMINI".equals(source), false, fallbackReason,
+                List.of(), null, List.of(), categories, List.of()), AssistantIntent.CATALOGUE_CATEGORIES.name()));
+            }
+
+            private void streamProductInfoReply(String message, String source, String fallbackReason,
+                            Consumer<AssistantStreamEvent> events) {
+            List<Product> products = findProductsForQuestion(message);
+            Map<Long, Rating> ratings = readRatings();
+            List<AssistantChatResponse.ProductMatch> matches = products.stream()
+                .limit(MAX_RESULTS)
+                .map(product -> toMatch(product, ratings.get(product.getId())))
+                .toList();
+            String reply = matches.isEmpty()
+                ? "I couldn’t match that to a product in our catalogue. Tell me the product name or category and I’ll look it up."
+                : matches.stream().map(product -> product.name() + " — "
+                    + (product.brand() == null ? "brand not listed" : product.brand()) + ", "
+                    + (product.category() == null ? "category not listed" : product.category().name()) + ", price "
+                    + product.price() + ", " + (product.stock() == null || product.stock() <= 0 ? "out of stock" : "in stock")
+                    + (product.waterproof() == null ? "" : product.waterproof() ? ", waterproof" : ", not marked waterproof")
+                    + (product.ratingCount() == 0 ? ", no reviews yet" : ", average rating "
+                    + String.format(Locale.ROOT, "%.1f", product.averageRating()) + " from " + product.ratingCount() + " reviews"))
+                    .collect(java.util.stream.Collectors.joining("; ")) + ".";
+            events.accept(AssistantStreamEvent.token(reply, AssistantIntent.PRODUCT_INFO.name()));
+            events.accept(AssistantStreamEvent.finalResponse(new AssistantChatResponse(reply, matches,
+                ShoppingIntent.empty(), source, "GEMINI".equals(source), false, fallbackReason),
+                AssistantIntent.PRODUCT_INFO.name()));
+            }
+
+            private void streamProductReviewsReply(String message, String source, String fallbackReason,
+                               Consumer<AssistantStreamEvent> events) {
+            List<Product> products = findProductsForQuestion(message);
+            List<AssistantChatResponse.ReviewSummary> summaries = products.stream().limit(MAX_RESULTS).map(product -> {
+                List<Review> reviews = reviewRepository.findByProductId(product.getId());
+                List<Review> validReviews = reviews.stream().filter(review -> review.getRating() != null).toList();
+                double averageRating = validReviews.stream().mapToInt(Review::getRating).average().orElse(0.0);
+                List<AssistantChatResponse.ReviewEntry> entries = reviews.stream().limit(5)
+                    .map(review -> new AssistantChatResponse.ReviewEntry(review.getRating(), review.getComment()))
+                    .toList();
+                return new AssistantChatResponse.ReviewSummary(product.getId(), product.getName(), averageRating,
+                    validReviews.size(), entries);
+            }).toList();
+            String reply = summaries.isEmpty()
+                ? "I couldn’t match that product in our catalogue. Tell me its name and I’ll check its reviews."
+                : summaries.stream().map(summary -> summary.ratingCount() == 0
+                    ? summary.productName() + " has no reviews yet."
+                    : summary.productName() + " is rated " + String.format(Locale.ROOT, "%.1f", summary.averageRating())
+                    + " out of 5 from " + summary.ratingCount() + " reviews.")
+                    .collect(java.util.stream.Collectors.joining(" "));
+            events.accept(AssistantStreamEvent.token(reply, AssistantIntent.PRODUCT_REVIEWS.name()));
+            events.accept(AssistantStreamEvent.finalResponse(new AssistantChatResponse(reply, List.of(),
+                ShoppingIntent.empty(), source, "GEMINI".equals(source), false, fallbackReason,
+                List.of(), null, List.of(), List.of(), summaries), AssistantIntent.PRODUCT_REVIEWS.name()));
+            }
+
+            private List<Product> findProductsForQuestion(String message) {
+            String normalized = message.toLowerCase(Locale.ROOT);
+            List<Product> catalogue = productRepository.findAll();
+            List<Product> exactNameMatches = catalogue.stream()
+                .filter(product -> product.getName() != null && normalized.contains(product.getName().toLowerCase(Locale.ROOT)))
+                .toList();
+            if (!exactNameMatches.isEmpty()) return exactNameMatches;
+
+            ShoppingIntent parsed = normalize(fallbackParser.parse(message, catalogue));
+            List<String> keywords = parsed.keywords().stream()
+                .filter(word -> !List.of("product", "products", "review", "reviews", "rating", "ratings", "detail", "details", "information", "info", "tell", "about", "what", "read", "show").contains(word))
+                .toList();
+            if (keywords.isEmpty()) return List.of();
+            return catalogue.stream().filter(product -> keywords.stream().anyMatch(word ->
+                contains(product.getName(), word) || contains(product.getBrand(), word)
+                    || contains(product.getDescription(), word)
+                    || product.getCategory() != null && contains(product.getCategory().getName(), word)))
+                .toList();
+            }
 
     private void streamCartReply(Long userId, String source, String fallbackReason,
                                  Consumer<AssistantStreamEvent> events) {
         AssistantIntent intent = AssistantIntent.ACCOUNT_CART;
-        if (userId == null) {
+        User accountUser = userId == null ? null : userRepository.findById(userId).orElse(null);
+        if (accountUser == null || !"CUSTOMER".equalsIgnoreCase(accountUser.getRole())) {
             String reply = "Please log in to your customer account so I can show your cart.";
             events.accept(AssistantStreamEvent.token(reply, intent.name()));
             events.accept(AssistantStreamEvent.finalResponse(new AssistantChatResponse(reply, List.of(),
@@ -290,17 +472,21 @@ public class ShoppingAssistantService {
                 List.of(), cartView, List.of()), intent.name()));
     }
 
-    private void streamOrdersReply(Long userId, String source, String fallbackReason,
+    private void streamOrdersReply(Long userId, String message, String source, String fallbackReason,
                                    Consumer<AssistantStreamEvent> events) {
         AssistantIntent intent = AssistantIntent.ACCOUNT_ORDERS;
-        if (userId == null) {
+        User accountUser = userId == null ? null : userRepository.findById(userId).orElse(null);
+        if (accountUser == null || !"CUSTOMER".equalsIgnoreCase(accountUser.getRole())) {
             String reply = "Please log in to your customer account so I can show your previous orders.";
             events.accept(AssistantStreamEvent.token(reply, intent.name()));
             events.accept(AssistantStreamEvent.finalResponse(new AssistantChatResponse(reply, List.of(),
                     ShoppingIntent.empty(), source, "GEMINI".equals(source), false, fallbackReason), intent.name()));
             return;
         }
-        List<Order> orders = orderRepository.findByUserId(userId);
+        String statusFilter = orderStatusFilter(message);
+        List<Order> orders = orderRepository.findByUserId(userId).stream()
+            .filter(order -> statusFilter == null || statusFilter.equals(normalizeOrderStatus(order.getStatus())))
+            .toList();
         List<AssistantChatResponse.OrderView> views = orders.stream().map(order -> {
             List<AssistantChatResponse.OrderEntry> entries = orderItemRepository.findByOrderId(order.getId()).stream()
                     .filter(item -> item.getProduct() != null)
@@ -313,8 +499,16 @@ public class ShoppingAssistantService {
                     entries, total);
         }).toList();
         String reply = views.isEmpty()
-                ? "You haven’t placed any orders yet. When you do, I can show them here."
-                : "You have " + views.size() + " order" + (views.size() == 1 ? "" : "s") + ".";
+                ? statusFilter == null
+                    ? "You haven’t placed any orders yet. When you do, I can show them here."
+                    : "You have no " + statusFilter.toLowerCase(Locale.ROOT) + " orders in your order history."
+                : statusFilter == null
+                    ? "You have " + views.size() + " order" + (views.size() == 1 ? "" : "s") + ". "
+                        + views.stream().map(order -> "Order #" + order.id() + " is "
+                                + normalizeOrderStatus(order.status()).toLowerCase(Locale.ROOT) + ".")
+                                .collect(java.util.stream.Collectors.joining(" "))
+                    : "You have " + views.size() + " " + statusFilter.toLowerCase(Locale.ROOT)
+                        + " order" + (views.size() == 1 ? "" : "s") + ".";
         events.accept(AssistantStreamEvent.token(reply, intent.name()));
         events.accept(AssistantStreamEvent.finalResponse(new AssistantChatResponse(reply, List.of(),
                 ShoppingIntent.empty(), source, "GEMINI".equals(source), false, fallbackReason,
@@ -329,10 +523,27 @@ public class ShoppingAssistantService {
         return new AssistantChatResponse.OrderEntry(product.getId(), product.getName(), quantity, unitPrice);
     }
 
+    private static String orderStatusFilter(String message) {
+        String normalized = message == null ? "" : message.toLowerCase(Locale.ROOT);
+        if (normalized.matches(".*\\b(delivered|delivery complete)\\b.*")) return "DELIVERED";
+        if (normalized.matches(".*\\b(shipped|shipping|on the way|dispatched)\\b.*")) return "SHIPPED";
+        if (normalized.matches(".*\\b(processing|being prepared)\\b.*")) return "PROCESSING";
+        if (normalized.matches(".*\\b(cancelled|canceled)\\b.*")) return "CANCELLED";
+        if (normalized.matches(".*\\b(placed|pending|new order)\\b.*")) return "PLACED";
+        return null;
+    }
+
+    private static String normalizeOrderStatus(String status) {
+        return status == null ? "PENDING" : status.trim().toUpperCase(Locale.ROOT);
+    }
+
     private AssistantAnalysis normalizeAnalysis(AssistantAnalysis analysis, String message) {
-        if (analysis == null || analysis.intent() == null) return classifyLocally(message);
+        if (analysis == null || analysis.intent() == null) return classifyLocally(message, List.of());
         ShoppingIntent extracted = mergeFilters(analysis.filters(), fallbackParser.parse(message, List.of()));
         AssistantIntent intent = analysis.intent();
+        if (isAccountOrderStatusQuery(message)) {
+            intent = AssistantIntent.ACCOUNT_ORDERS;
+        }
         if (intent == AssistantIntent.SHOPPING_VAGUE && hasSearchConstraint(extracted)) {
             intent = AssistantIntent.SHOPPING_CLEAR;
         }
@@ -361,9 +572,13 @@ public class ShoppingAssistantService {
                 first.waterproof() != null ? first.waterproof() : second.waterproof()));
     }
 
-    private AssistantAnalysis classifyLocally(String message) {
+    AssistantAnalysis classifyLocally(String message) {
+        return classifyLocally(message, List.of());
+    }
+
+    AssistantAnalysis classifyLocally(String message, List<AssistantChatRequest.ChatTurn> history) {
         String normalized = message == null ? "" : message.trim().toLowerCase(Locale.ROOT);
-        if (normalized.matches("^(hi|hello|hey|good morning|good afternoon|good evening|howdy)[.!\\s]*(there|friend|everyone|all|folks)?[.!\\s\\p{So}]*$")) {
+        if (normalized.matches("^(hi|hello|hey|good morning|good afternoon|good evening|howdy|greetings|welcome|good day)[.!\\s]*(there|friend|everyone|all|folks)?[.!\\s\\p{So}]*$")) {
             return new AssistantAnalysis(AssistantIntent.GREETING, ShoppingIntent.empty(), null);
         }
         if (normalized.matches(".*\\b(my cart|my basket|the cart|the basket|cart|basket)\\b.*")) {
@@ -373,36 +588,99 @@ public class ShoppingAssistantService {
         // Note: bare "my order" (delivery/status questions) stays a question; only history/past-purchase
         // wording, or an explicit view/show request for "my orders", routes to account orders.
         boolean isQuestion = normalized.matches(".*\\b(what|how|why|when|where|who|which)\\b.*");
-        if (normalized.matches(".*\\b(my orders|order history|previous(ly)? (orders?|purchases?|purchased|bought)|my (purchases?|bought)|my order history|what (have|had) i (bought|purchased)|what i (bought|purchased))\\b.*")
+        if (normalized.matches(".*\\b(my orders|order history|past (orders?|purchases?|purchased|bought)|previous(ly)? (orders?|purchases?|purchased|bought)|my (purchases?|bought)|my order history|what (have|had) i (bought|purchased)|what i (bought|purchased))\\b.*")
                 || (!isQuestion && normalized.matches(".*\\b(show|view|see|list|get|open|check)\\b.*\\bmy orders\\b.*"))) {
             return new AssistantAnalysis(AssistantIntent.ACCOUNT_ORDERS, ShoppingIntent.empty(), null);
+        }
+        if (isAccountOrderStatusQuery(normalized)) {
+            return new AssistantAnalysis(AssistantIntent.ACCOUNT_ORDERS, ShoppingIntent.empty(), null);
+        }
+        if (normalized.matches(".*\\b(rewards?|loyalty|points?)\\b.*")) {
+            return new AssistantAnalysis(AssistantIntent.REWARDS_INFO, ShoppingIntent.empty(), null);
+        }
+        if (normalized.matches(".*\\b(low stock|my inventory|my products|supplier products|products i supply|stock levels?)\\b.*")) {
+            return new AssistantAnalysis(AssistantIntent.SUPPLIER_INVENTORY, ShoppingIntent.empty(), null);
+        }
+        if (normalized.matches(".*\\b(orders containing my products|orders for my products|my supplier orders|my product orders)\\b.*")) {
+            return new AssistantAnalysis(AssistantIntent.SUPPLIER_ORDERS, ShoppingIntent.empty(), null);
+        }
+        if (normalized.matches(".*\\b(store overview|admin overview|store summary|business overview)\\b.*")) {
+            return new AssistantAnalysis(AssistantIntent.ADMIN_OVERVIEW, ShoppingIntent.empty(), null);
+        }
+        if (normalized.matches(".*\\b(all store orders|store orders|how many orders|total orders)\\b.*")) {
+            return new AssistantAnalysis(AssistantIntent.ADMIN_ORDERS, ShoppingIntent.empty(), null);
+        }
+        if (normalized.matches(".*\\b(all reviews|store reviews|how many reviews|total reviews)\\b.*")) {
+            return new AssistantAnalysis(AssistantIntent.ADMIN_REVIEWS, ShoppingIntent.empty(), null);
+        }
+        if (normalized.matches(".*\\b(all users|user accounts|how many users|total users)\\b.*")) {
+            return new AssistantAnalysis(AssistantIntent.ADMIN_USERS, ShoppingIntent.empty(), null);
+        }
+        if (normalized.matches(".*\\b(all suppliers|supplier accounts|how many suppliers|total suppliers)\\b.*")) {
+            return new AssistantAnalysis(AssistantIntent.ADMIN_SUPPLIERS, ShoppingIntent.empty(), null);
+        }
+        if (normalized.matches(".*\\b(categories|category list|product categories|types of products)\\b.*")) {
+            return new AssistantAnalysis(AssistantIntent.CATALOGUE_CATEGORIES, ShoppingIntent.empty(), null);
+        }
+        boolean numericStarFilter = normalized.matches(".*\\b[1-5]\\s*stars?\\b.*");
+        boolean reviewLookup = normalized.matches(".*\\breviews?\\b.*")
+            || normalized.matches(".*\\brating of\\b.*")
+            || normalized.matches(".*\\baverage rating\\b.*")
+            || normalized.matches(".*\\b(how is|what is) .+ rated\\b.*")
+            || normalized.matches(".*\\b(show|read|summarize|summary)\\b.*\\b(ratings?)\\b.*\\b(for|of|about|on)\\b.*");
+        if (reviewLookup && !numericStarFilter && !normalized.matches(".*\\btop rated\\b.*")) {
+            return new AssistantAnalysis(AssistantIntent.PRODUCT_REVIEWS, ShoppingIntent.empty(), null);
+        }
+        if (isProductInfoQuestion(normalized)) {
+            return new AssistantAnalysis(AssistantIntent.PRODUCT_INFO, ShoppingIntent.empty(), null);
         }
         // Genuine questions (how/what/why/when...) are answered, not searched — even when they
         // name a product attribute such as "waterproof". Check this before shopping cues.
         if (isQuestion) {
             return new AssistantAnalysis(AssistantIntent.GENERAL_QUESTION, ShoppingIntent.empty(), null);
         }
-        boolean shoppingCue = normalized.matches(".*\\b(find|show|search|buy|purchase|recommend|suggest|suggestion|looking for|shop|product|products|under|below|between|price|in stock|available|waterproof|rated|cheapest|budget)\\b.*");
-        if (shoppingCue) {
-            List<Product> catalogue = productRepository.findAll();
-            ShoppingIntent parsed = normalize(fallbackParser.parse(normalized, catalogue));
-            boolean hasStructuredConstraint = parsed.category() != null || parsed.brand() != null
-                    || parsed.minPrice() != null || parsed.maxPrice() != null
-                    || parsed.waterproof() != null || parsed.minRating() != null;
+        boolean shoppingCue = normalized.matches(".*\\b(find|show|search|buy|purchase|recommend|suggest|suggestion|looking for|shop|product|products|under|below|between|price|in stock|available|waterproof|rated|cheapest|budget|something|anything|trip|travel|gift|present|filter)\\b.*");
+        boolean hasRating = normalized.matches(".*\\b[1-5]\\s*(?:stars?|rating)\\b.*");
+        boolean possibleCategoryOnly = normalized.matches("^[\\p{L} ]{2,40}$");
+        List<Product> catalogue = (shoppingCue || hasRating || possibleCategoryOnly)
+            ? productRepository.findAll() : List.of();
+        ShoppingIntent parsed = fallbackParser.parse(normalized, catalogue);
+        boolean ratingFollowup = normalized.matches(".*\\b(filter|sort|show|find|search|by|minimum|min|at least|rating|ratings|stars?)\\b.*")
+            && normalized.matches(".*\\b(rating|ratings|stars?)\\b.*");
+        if (ratingFollowup && parsed.minRating() == null) {
+            String category = parsed.category() != null ? parsed.category() : recentCategory(history, catalogue);
+            ShoppingIntent followupFilters = new ShoppingIntent(category, parsed.brand(), parsed.keywords(),
+                parsed.minPrice(), parsed.maxPrice(), null, parsed.sort(), parsed.waterproof());
+            return new AssistantAnalysis(AssistantIntent.SHOPPING_VAGUE, followupFilters,
+                category == null
+                    ? "What product category should I filter, and what minimum star rating do you want?"
+                    : "What minimum star rating should I use for " + category + "? For example, 4 stars or higher.");
+        }
+        if (hasRating && parsed.minRating() != null) {
+            String category = parsed.category() != null ? parsed.category() : recentCategory(history, catalogue);
+            ShoppingIntent filters = new ShoppingIntent(category, parsed.brand(), parsed.keywords(), parsed.minPrice(),
+                parsed.maxPrice(), parsed.minRating(), parsed.sort(), parsed.waterproof());
+            return new AssistantAnalysis(AssistantIntent.SHOPPING_CLEAR, filters, null);
+        }
+        if (shoppingCue || parsed.category() != null) {
+            ShoppingIntent normalizedFilters = normalize(parsed);
+            boolean hasStructuredConstraint = normalizedFilters.category() != null || normalizedFilters.brand() != null
+                    || normalizedFilters.minPrice() != null || normalizedFilters.maxPrice() != null
+                    || normalizedFilters.waterproof() != null || normalizedFilters.minRating() != null;
             if (hasStructuredConstraint) {
-                return new AssistantAnalysis(AssistantIntent.SHOPPING_CLEAR, parsed, null);
+                return new AssistantAnalysis(AssistantIntent.SHOPPING_CLEAR, normalizedFilters, null);
             }
-            if (!parsed.keywords().isEmpty()) {
+            if (!normalizedFilters.keywords().isEmpty()) {
                 Map<Long, Rating> ratings = readRatings();
-                boolean anyMatch = catalogue.stream().anyMatch(product -> matches(product, parsed, ratings));
+                boolean anyMatch = catalogue.stream().anyMatch(product -> matches(product, normalizedFilters, ratings));
                 if (anyMatch) {
-                    return new AssistantAnalysis(AssistantIntent.SHOPPING_CLEAR, parsed, null);
+                    return new AssistantAnalysis(AssistantIntent.SHOPPING_CLEAR, normalizedFilters, null);
                 }
                 return new AssistantAnalysis(AssistantIntent.SHOPPING_VAGUE, ShoppingIntent.empty(),
-                        "I couldn't find anything in our catalogue matching \"" + String.join(" ", parsed.keywords())
+                        "I couldn't find anything in our catalogue matching \"" + String.join(" ", normalizedFilters.keywords())
                                 + "\". What type of product are you looking for, and do you have a budget or must-have feature?");
             }
-            return new AssistantAnalysis(AssistantIntent.SHOPPING_VAGUE, parsed,
+            return new AssistantAnalysis(AssistantIntent.SHOPPING_VAGUE, normalizedFilters,
                     "What type of product are you looking for, and do you have a budget or must-have feature?");
         }
         if (normalized.matches(".*\\b(need|want|looking)\\b.*")) {
@@ -410,6 +688,32 @@ public class ShoppingAssistantService {
                     "What type of product are you looking for, and do you have a budget or must-have feature?");
         }
         return new AssistantAnalysis(AssistantIntent.UNSUPPORTED, ShoppingIntent.empty(), null);
+    }
+
+    private static boolean isAccountOrderStatusQuery(String message) {
+        String normalized = message == null ? "" : message.toLowerCase(Locale.ROOT);
+        boolean mentionsOrder = normalized.matches(".*\\b(order|orders|purchase|purchases)\\b.*");
+        boolean asksStatus = normalized.matches(".*\\b(status|track|tracking|arrive|arrival|delivery|delivered|shipped|shipping|processing|cancelled|canceled|placed|pending)\\b.*");
+        return mentionsOrder && asksStatus;
+    }
+
+    private String recentCategory(List<AssistantChatRequest.ChatTurn> history, List<Product> catalogue) {
+        if (history == null || history.isEmpty()) return null;
+        for (int index = history.size() - 1; index >= 0; index--) {
+            AssistantChatRequest.ChatTurn turn = history.get(index);
+            if (turn == null || !"user".equalsIgnoreCase(turn.role()) || turn.content() == null) continue;
+            String category = fallbackParser.parse(turn.content(), catalogue).category();
+            if (category != null) return category;
+        }
+        return null;
+    }
+
+    private boolean isProductInfoQuestion(String normalized) {
+        boolean detailCue = normalized.matches(".*\\b(details?|information|info|price|cost|stock|available|availability|brand|category|description|waterproof)\\b.*")
+                || normalized.matches(".*\\b(tell me about|what is|what's|describe|more about)\\b.*");
+        if (!detailCue) return false;
+        return productRepository.findAll().stream().anyMatch(product ->
+                product.getName() != null && normalized.contains(product.getName().toLowerCase(Locale.ROOT)));
     }
 
     private static String shoppingReplyPrompt(String message, ShoppingIntent filters,
